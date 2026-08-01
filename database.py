@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import sqlite3
 import tempfile
+import uuid
 from contextlib import contextmanager
 from datetime import date, datetime
 from pathlib import Path
@@ -43,6 +45,47 @@ INVENTORY_FIELDS = (
     "source_notes",
     "is_active",
 )
+
+
+def _code_tokens(value: Any) -> list[str]:
+    return re.findall(r"[A-Z0-9]+", str(value or "").upper())
+
+
+def item_short_form(item_name: Any) -> str:
+    """Return a stable, readable short form for an inventory item name."""
+    tokens = _code_tokens(item_name)
+    if not tokens:
+        return "ITEM"
+    if len(tokens) == 1:
+        token = tokens[0]
+        return token if len(token) <= 6 else token[:4]
+    if any(character.isdigit() for character in tokens[0]):
+        short = tokens[0][:6] + "".join(token[0] for token in tokens[1:] if token)
+    else:
+        short = "".join(token[0] for token in tokens if token)
+    return short[:8] or "ITEM"
+
+
+def description_short_form(description: Any) -> str:
+    """Return a compact pack/description component for an inventory code."""
+    tokens = _code_tokens(description)
+    if not tokens:
+        return "NA"
+    compact = "".join(tokens)
+    return compact[:12]
+
+
+def inventory_code_base(item_name: Any, description: Any) -> str:
+    return f"{item_short_form(item_name)}-{description_short_form(description)}"
+
+
+def make_inventory_code(item_name: Any, description: Any, item_id: int) -> str:
+    """Build ITEMSHORT-DESCRIPTION-ID, with ID keeping historical lots unique."""
+    return f"{inventory_code_base(item_name, description)}-{int(item_id):05d}"
+
+
+def _temporary_inventory_code() -> str:
+    return f"TMP-{uuid.uuid4().hex.upper()}"
 
 
 def resolve_db_path(db_path: str | Path | None = None) -> Path:
@@ -149,6 +192,7 @@ def initialize_database(db_path: str | Path | None = None) -> None:
             defaults.items(),
         )
         connection.commit()
+    recode_all_inventory(db_path)
 
 
 def get_settings(db_path: str | Path | None = None) -> dict[str, str]:
@@ -238,15 +282,34 @@ def _clean_text(value: Any) -> str | None:
     return text or None
 
 
-def _next_code(connection: sqlite3.Connection, reserved: set[str]) -> str:
-    last_id = int(connection.execute("SELECT COALESCE(MAX(id), 0) FROM inventory").fetchone()[0])
-    sequence = last_id + 1
-    while True:
-        code = f"INV-{sequence:05d}"
-        if code not in reserved:
-            reserved.add(code)
-            return code
-        sequence += 1
+def recode_all_inventory(db_path: str | Path | None = None) -> int:
+    """Migrate every record to the current ITEMSHORT-DESCRIPTION-ID convention."""
+    with transaction(db_path) as connection:
+        rows = connection.execute(
+            "SELECT id, item_name, description, inventory_code FROM inventory ORDER BY id"
+        ).fetchall()
+        changes = [
+            (
+                int(row["id"]),
+                make_inventory_code(row["item_name"], row["description"], row["id"]),
+            )
+            for row in rows
+            if row["inventory_code"]
+            != make_inventory_code(row["item_name"], row["description"], row["id"])
+        ]
+        # A temporary first pass prevents unique-key collisions with any legacy
+        # code that happens to equal another record's new code.
+        for item_id, _ in changes:
+            connection.execute(
+                "UPDATE inventory SET inventory_code = ? WHERE id = ?",
+                (_temporary_inventory_code(), item_id),
+            )
+        for item_id, new_code in changes:
+            connection.execute(
+                "UPDATE inventory SET inventory_code = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_code, item_id),
+            )
+    return len(changes)
 
 
 def insert_items(
@@ -261,32 +324,23 @@ def insert_items(
         if replace:
             connection.execute("DELETE FROM stock_movements")
             connection.execute("DELETE FROM inventory")
-        reserved = {
-            row[0]
-            for row in connection.execute("SELECT inventory_code FROM inventory").fetchall()
-        }
         for raw_item in items:
             try:
                 item = _normalise_item(raw_item)
             except (TypeError, ValueError):
                 skipped += 1
                 continue
-            code = item.get("inventory_code")
-            if not code or code in reserved:
-                if code in reserved:
-                    source_note = item.get("source_notes") or ""
-                    item["source_notes"] = (
-                        f"{source_note}; Duplicate source inventory code: {code}"
-                    ).strip("; ")
-                code = _next_code(connection, reserved)
-            else:
-                reserved.add(code)
-            item["inventory_code"] = code
+            item["inventory_code"] = _temporary_inventory_code()
             columns = [field for field in INVENTORY_FIELDS]
             placeholders = ", ".join("?" for _ in columns)
-            connection.execute(
+            cursor = connection.execute(
                 f"INSERT INTO inventory ({', '.join(columns)}) VALUES ({placeholders})",
                 [item.get(column) for column in columns],
+            )
+            item_id = int(cursor.lastrowid)
+            connection.execute(
+                "UPDATE inventory SET inventory_code = ? WHERE id = ?",
+                (make_inventory_code(item["item_name"], item.get("description"), item_id), item_id),
             )
             inserted += 1
     return {"inserted": inserted, "skipped": skipped}
@@ -295,23 +349,22 @@ def insert_items(
 def add_item(item: Mapping[str, Any], db_path: str | Path | None = None) -> int:
     normalised = _normalise_item(item)
     with transaction(db_path) as connection:
-        reserved = {
-            row[0]
-            for row in connection.execute("SELECT inventory_code FROM inventory").fetchall()
-        }
-        code = normalised.get("inventory_code")
-        if not code:
-            code = _next_code(connection, reserved)
-        elif code in reserved:
-            raise ValueError(f"Inventory code {code} already exists.")
-        normalised["inventory_code"] = code
+        normalised["inventory_code"] = _temporary_inventory_code()
         columns = [field for field in INVENTORY_FIELDS]
         placeholders = ", ".join("?" for _ in columns)
         cursor = connection.execute(
             f"INSERT INTO inventory ({', '.join(columns)}) VALUES ({placeholders})",
             [normalised.get(column) for column in columns],
         )
-        return int(cursor.lastrowid)
+        item_id = int(cursor.lastrowid)
+        inventory_code = make_inventory_code(
+            normalised["item_name"], normalised.get("description"), item_id
+        )
+        connection.execute(
+            "UPDATE inventory SET inventory_code = ? WHERE id = ?",
+            (inventory_code, item_id),
+        )
+        return item_id
 
 
 def update_item(
@@ -319,7 +372,7 @@ def update_item(
     updates: Mapping[str, Any],
     db_path: str | Path | None = None,
 ) -> None:
-    allowed = set(INVENTORY_FIELDS) - {"source_row"}
+    allowed = set(INVENTORY_FIELDS) - {"source_row", "inventory_code"}
     values: dict[str, Any] = {}
     for key, value in updates.items():
         if key not in allowed:
@@ -329,10 +382,6 @@ def update_item(
         values["item_name"] = str(values["item_name"] or "").strip()
         if not values["item_name"]:
             raise ValueError("Item name is required.")
-    if "inventory_code" in values:
-        values["inventory_code"] = str(values["inventory_code"] or "").strip().upper()
-        if not values["inventory_code"]:
-            raise ValueError("Inventory code is required.")
     for field in (
         "unit_price",
         "total_test_effective",
@@ -348,15 +397,19 @@ def update_item(
         return
     assignments = ", ".join(f"{column} = ?" for column in values)
     with transaction(db_path) as connection:
-        try:
-            cursor = connection.execute(
-                f"UPDATE inventory SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                [*values.values(), int(item_id)],
-            )
-        except sqlite3.IntegrityError as exc:
-            raise ValueError("Inventory code already exists or a value is invalid.") from exc
+        cursor = connection.execute(
+            f"UPDATE inventory SET {assignments}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            [*values.values(), int(item_id)],
+        )
         if cursor.rowcount != 1:
             raise ValueError("Inventory record was not found.")
+        row = connection.execute(
+            "SELECT item_name, description FROM inventory WHERE id = ?", (int(item_id),)
+        ).fetchone()
+        connection.execute(
+            "UPDATE inventory SET inventory_code = ? WHERE id = ?",
+            (make_inventory_code(row["item_name"], row["description"], item_id), int(item_id)),
+        )
 
 
 def bulk_update_items(
@@ -573,6 +626,7 @@ def fetch_movements_dataframe(db_path: str | Path | None = None) -> pd.DataFrame
         SELECT
             m.id,
             m.moved_at,
+            i.id AS inventory_id,
             i.inventory_code,
             i.item_name,
             i.brand,

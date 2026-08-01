@@ -24,7 +24,8 @@ GREY = "637381"
 
 
 FRIENDLY_COLUMNS = {
-    "id": "Database ID",
+    "id": "Inventory ID",
+    "inventory_id": "Inventory ID",
     "inventory_code": "Inventory Code",
     "item_name": "Item Name",
     "brand": "Brand",
@@ -68,6 +69,7 @@ FRIENDLY_COLUMNS = {
 
 
 INVENTORY_REPORT_COLUMNS = [
+    "id",
     "inventory_code",
     "item_name",
     "brand",
@@ -101,6 +103,7 @@ INVENTORY_REPORT_COLUMNS = [
 
 MOVEMENT_REPORT_COLUMNS = [
     "moved_at",
+    "inventory_id",
     "inventory_code",
     "item_name",
     "brand",
@@ -323,7 +326,6 @@ def create_import_template() -> bytes:
     sheet = workbook.active
     sheet.title = "Inventory Import"
     headers = [
-        "Inventory Code",
         "Item Name",
         "Brand",
         "Category",

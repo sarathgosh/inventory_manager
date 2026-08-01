@@ -6,7 +6,10 @@ A Streamlit and SQLite application built from `Inventory list(1).xlsx`. It keeps
 
 - Dashboard with inventory, expiry, reorder, value and data-quality indicators
 - Searchable inventory list with filters and a bulk quick editor
+- Cascading item, brand, category, test-volume and description dropdowns sourced from the database
 - Add, edit, archive and restore inventory records
+- Incremental unique inventory IDs used for record selection and editing
+- Automatic `ITEMSHORT-DESCRIPTION-ID` inventory codes for existing and new records
 - Stock receipts, issues and adjustments with an auditable movement history
 - Separate stock and expiry statuses so missing quantities are not incorrectly treated as zero
 - Full inventory, reorder, expiry, valuation, data-quality and movement reports
@@ -22,7 +25,8 @@ The source contains one visible sheet, `Inventory List`, with 407 populated inve
 The workbook also contains historical duplicates, hidden rows, incomplete stock values and inconsistent text in some date cells. The application therefore:
 
 - preserves every populated source row;
-- assigns a unique application inventory code while retaining the source ID and row number;
+- assigns each record an incremental unique ID and retains the source ID and row number;
+- generates inventory codes using item short form, description and ID (for example `GLUC-5X100-00011`);
 - imports valid dates and stores unparsed source values as review notes;
 - calculates cost per test, profit per test and inventory value only when the required inputs exist;
 - flags missing stock, price, reorder and expiry information for review.
@@ -61,7 +65,8 @@ To store the database elsewhere, set the environment variable `INVENTORY_DB_PATH
 ## Import rules
 
 - `Item Name` (or `Item`) is required.
-- Inventory codes are generated when blank.
+- Inventory IDs are assigned incrementally by SQLite and are never entered manually.
+- Inventory codes are regenerated automatically as `ITEMSHORT-DESCRIPTION-ID`.
 - Dates can use `YYYY-MM-DD` or `DD-MM-YYYY`.
 - Blank numeric cells remain unknown; they are not changed to zero.
 - Append mode adds records to the current list.
@@ -82,6 +87,7 @@ It verifies the 407-row workbook import, unique inventory codes, SQLite CRUD ope
 ## Project files
 
 - `app.py` — Streamlit interface
+- `catalog.py` — database-backed cascading dropdown and option helpers
 - `database.py` — SQLite schema, CRUD, calculations and movement transactions
 - `importer.py` — original-workbook and Excel/CSV import logic
 - `reports.py` — report filters and formatted Excel/CSV generation

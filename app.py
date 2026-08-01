@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import date
 from pathlib import Path
@@ -8,6 +9,14 @@ from typing import Any
 import pandas as pd
 import streamlit as st
 
+from catalog import (
+    MISSING_OPTION,
+    database_options,
+    filter_by_option,
+    latest_record,
+    numeric_options,
+    option_to_value,
+)
 from database import (
     add_item,
     archive_item,
@@ -15,8 +24,10 @@ from database import (
     create_database_backup,
     fetch_inventory_dataframe,
     fetch_movements_dataframe,
+    get_item,
     get_settings,
     initialize_database,
+    inventory_code_base,
     insert_items,
     inventory_count,
     record_stock_movement,
@@ -164,6 +175,36 @@ def date_value(value: Any) -> date:
     return date.today()
 
 
+def stable_widget_key(prefix: str, *parts: Any) -> str:
+    payload = "|".join(text_value(part) for part in parts)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}_{digest}"
+
+
+def select_existing_or_new(
+    container: Any,
+    label: str,
+    options: list[str],
+    default: Any,
+    *,
+    key: str,
+    placeholder: str = "Select a database value or enter a new value",
+) -> str | None:
+    clean_options = list(dict.fromkeys(option for option in options if text_value(option)))
+    default_text = text_value(default)
+    if default_text and default_text not in clean_options:
+        clean_options.insert(0, default_text)
+    index = clean_options.index(default_text) if default_text in clean_options else None
+    return container.selectbox(
+        label,
+        options=clean_options,
+        index=index,
+        placeholder=placeholder,
+        accept_new_options=True,
+        key=key,
+    )
+
+
 def apply_inventory_filters(frame: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
     if frame.empty:
         return frame
@@ -293,6 +334,7 @@ def render_dashboard(inventory: pd.DataFrame, currency: str) -> None:
         ["_priority", "expiry_date", "item_name"], na_position="last"
     ).head(20)
     priority_columns = [
+        "id",
         "inventory_code",
         "item_name",
         "brand",
@@ -325,6 +367,7 @@ def render_inventory(inventory: pd.DataFrame, warning_days: int) -> None:
         filtered = apply_inventory_filters(frame, "inventory")
         st.caption(f"Showing {len(filtered):,} of {len(frame):,} records")
         browse_columns = [
+            "id",
             "inventory_code",
             "item_name",
             "brand",
@@ -408,76 +451,236 @@ def render_inventory(inventory: pd.DataFrame, warning_days: int) -> None:
 
     with add_tab:
         st.subheader("Create inventory record")
-        with st.form("add_inventory_form", clear_on_submit=True):
-            first = st.columns(4)
-            code = first[0].text_input("Inventory code", placeholder="Auto-generated if blank")
-            item_name = first[1].text_input("Item name *")
-            brand = first[2].text_input("Brand")
-            category = first[3].text_input("Category", value="Laboratory Inventory")
-
-            second = st.columns(4)
-            test_volume = second[0].text_input("Test volume")
-            description = second[1].text_input("Description / pack size")
-            batch_no = second[2].text_input("Batch / lot no.")
-            location = second[3].text_input("Storage location")
-
-            third = st.columns(4)
-            unit_price = third[0].text_input("Unit price", placeholder="Blank = unknown")
-            total_tests = third[1].text_input("Total test effective", placeholder="Blank = unknown")
-            selling_price = third[2].text_input("Selling price per test", placeholder="Blank = unknown")
-            quantity = third[3].text_input("Quantity in stock", placeholder="Blank = not set")
-
-            fourth = st.columns(4)
-            reorder_level = fourth[0].text_input("Reorder level", placeholder="Blank = not set")
-            reorder_quantity = fourth[1].text_input("Reorder quantity", placeholder="Blank = not set")
-            supplier = fourth[2].text_input("Supplier")
-            reminder_days = fourth[3].text_input("Reminder days", placeholder="Blank = not set")
-
-            date_columns = st.columns(3)
-            has_opened = date_columns[0].checkbox("Opened date available", value=False)
-            opened_date = date_columns[0].date_input(
-                "Opened date", value=date.today(), disabled=not has_opened
+        if inventory.empty:
+            st.info("The database must contain at least one catalogue item before a record can be created.")
+        else:
+            st.caption(
+                "Select an item first. Each following dropdown is limited to values already matched "
+                "to that selection in the database."
             )
-            has_expiry = date_columns[1].checkbox("Expiry date available", value=True)
-            expiry_date = date_columns[1].date_input(
-                "Expiry date", value=date.today(), disabled=not has_expiry
+            item_options = database_options(inventory, "item_name", include_missing=False)
+            item_name = st.selectbox(
+                "Item name *",
+                options=item_options,
+                index=None,
+                placeholder="Select an inventory item",
+                key="add_catalogue_item",
             )
-            has_reorder_due = date_columns[2].checkbox("Reorder due date available", value=False)
-            reorder_due = date_columns[2].date_input(
-                "Reorder due date", value=date.today(), disabled=not has_reorder_due
-            )
-            notes = st.text_area("Notes")
-            submitted = st.form_submit_button("Add inventory record", type="primary")
-        if submitted:
-            try:
-                item_id = add_item(
-                    {
-                        "inventory_code": code,
-                        "item_name": item_name,
-                        "brand": brand,
-                        "category": category,
-                        "test_volume": test_volume,
-                        "description": description,
-                        "batch_no": batch_no,
-                        "storage_location": location,
-                        "unit_price": optional_number(unit_price, "Unit price"),
-                        "total_test_effective": optional_number(total_tests, "Total test effective"),
-                        "selling_price_per_test": optional_number(selling_price, "Selling price per test"),
-                        "quantity_in_stock": optional_number(quantity, "Quantity in stock"),
-                        "reorder_level": optional_number(reorder_level, "Reorder level"),
-                        "reorder_quantity": optional_number(reorder_quantity, "Reorder quantity"),
-                        "supplier": supplier,
-                        "reminder_days": optional_number(reminder_days, "Reminder days"),
-                        "opened_date": opened_date if has_opened else None,
-                        "expiry_date": expiry_date if has_expiry else None,
-                        "reorder_due_date": reorder_due if has_reorder_due else None,
-                        "notes": notes,
-                        "is_active": 1,
-                    }
+            if item_name is None:
+                st.info("Select an item to load its matching database options.")
+            else:
+                item_rows = filter_by_option(inventory, "item_name", item_name)
+                selectors = st.columns(4)
+
+                brand_options = database_options(item_rows, "brand")
+                brand_selection = selectors[0].selectbox(
+                    "Brand",
+                    brand_options,
+                    key=stable_widget_key("add_brand", item_name),
                 )
-                st.success(f"Inventory record created (database ID {item_id}).")
-            except ValueError as exc:
-                st.error(str(exc))
+                brand_rows = filter_by_option(item_rows, "brand", brand_selection)
+
+                category_options = database_options(brand_rows, "category")
+                category_selection = selectors[1].selectbox(
+                    "Category",
+                    category_options,
+                    key=stable_widget_key("add_category", item_name, brand_selection),
+                )
+                category_rows = filter_by_option(brand_rows, "category", category_selection)
+
+                volume_options = database_options(category_rows, "test_volume")
+                volume_selection = selectors[2].selectbox(
+                    "Test volume",
+                    volume_options,
+                    key=stable_widget_key(
+                        "add_volume", item_name, brand_selection, category_selection
+                    ),
+                )
+                volume_rows = filter_by_option(category_rows, "test_volume", volume_selection)
+
+                description_options = database_options(volume_rows, "description")
+                description_selection = selectors[3].selectbox(
+                    "Description / pack size",
+                    description_options,
+                    key=stable_widget_key(
+                        "add_description",
+                        item_name,
+                        brand_selection,
+                        category_selection,
+                        volume_selection,
+                    ),
+                )
+                matching_rows = filter_by_option(
+                    volume_rows, "description", description_selection
+                )
+                matched = latest_record(matching_rows)
+
+                brand = option_to_value(brand_selection)
+                category = option_to_value(category_selection) or "Laboratory Inventory"
+                test_volume = option_to_value(volume_selection)
+                description = option_to_value(description_selection)
+                code_preview = f"{inventory_code_base(item_name, description)}-[ID]"
+                st.markdown(
+                    f'<div class="status-note"><b>Inventory code:</b> {code_preview} &nbsp; '
+                    f'<b>Unique ID:</b> assigned incrementally when saved &nbsp; '
+                    f'<b>Database matches:</b> {len(matching_rows):,}</div>',
+                    unsafe_allow_html=True,
+                )
+
+                def matched_value(field: str) -> Any:
+                    return None if matched is None else matched.get(field)
+
+                form_signature = (
+                    item_name,
+                    brand_selection,
+                    category_selection,
+                    volume_selection,
+                    description_selection,
+                )
+                with st.form(stable_widget_key("add_inventory_form", *form_signature)):
+                    first = st.columns(4)
+                    first[0].text_input(
+                        "Unique inventory ID",
+                        value="Assigned automatically",
+                        disabled=True,
+                    )
+                    first[1].text_input(
+                        "Inventory code",
+                        value=code_preview,
+                        disabled=True,
+                    )
+                    batch_no = first[2].text_input("Batch / lot no.")
+                    quantity = first[3].text_input(
+                        "Quantity in stock", placeholder="Blank = not set"
+                    )
+
+                    second = st.columns(4)
+                    location = select_existing_or_new(
+                        second[0],
+                        "Storage location",
+                        database_options(item_rows, "storage_location", include_missing=False),
+                        matched_value("storage_location"),
+                        key=stable_widget_key("add_location", *form_signature),
+                    )
+                    supplier = select_existing_or_new(
+                        second[1],
+                        "Supplier",
+                        database_options(item_rows, "supplier", include_missing=False),
+                        matched_value("supplier"),
+                        key=stable_widget_key("add_supplier", *form_signature),
+                    )
+                    unit_price = select_existing_or_new(
+                        second[2],
+                        "Unit price",
+                        numeric_options(matching_rows, "unit_price"),
+                        matched_value("unit_price"),
+                        key=stable_widget_key("add_unit_price", *form_signature),
+                        placeholder="Select an existing price or enter a new one",
+                    )
+                    total_tests = select_existing_or_new(
+                        second[3],
+                        "Total test effective",
+                        numeric_options(matching_rows, "total_test_effective"),
+                        matched_value("total_test_effective"),
+                        key=stable_widget_key("add_total_tests", *form_signature),
+                        placeholder="Select an existing value or enter a new one",
+                    )
+
+                    third = st.columns(4)
+                    selling_price = select_existing_or_new(
+                        third[0],
+                        "Selling price per test",
+                        numeric_options(matching_rows, "selling_price_per_test"),
+                        matched_value("selling_price_per_test"),
+                        key=stable_widget_key("add_selling_price", *form_signature),
+                        placeholder="Select an existing price or enter a new one",
+                    )
+                    reorder_level = select_existing_or_new(
+                        third[1],
+                        "Reorder level",
+                        numeric_options(matching_rows, "reorder_level"),
+                        matched_value("reorder_level"),
+                        key=stable_widget_key("add_reorder_level", *form_signature),
+                        placeholder="Select an existing value or enter a new one",
+                    )
+                    reorder_quantity = select_existing_or_new(
+                        third[2],
+                        "Reorder quantity",
+                        numeric_options(matching_rows, "reorder_quantity"),
+                        matched_value("reorder_quantity"),
+                        key=stable_widget_key("add_reorder_quantity", *form_signature),
+                        placeholder="Select an existing value or enter a new one",
+                    )
+                    reminder_days = select_existing_or_new(
+                        third[3],
+                        "Reminder days",
+                        numeric_options(matching_rows, "reminder_days"),
+                        matched_value("reminder_days"),
+                        key=stable_widget_key("add_reminder_days", *form_signature),
+                        placeholder="Select an existing value or enter a new one",
+                    )
+
+                    date_columns = st.columns(3)
+                    has_opened = date_columns[0].checkbox("Opened date available", value=False)
+                    opened_date = date_columns[0].date_input(
+                        "Opened date", value=date.today(), disabled=not has_opened
+                    )
+                    has_expiry = date_columns[1].checkbox("Expiry date available", value=True)
+                    expiry_date = date_columns[1].date_input(
+                        "Expiry date", value=date.today(), disabled=not has_expiry
+                    )
+                    has_reorder_due = date_columns[2].checkbox(
+                        "Reorder due date available", value=False
+                    )
+                    reorder_due = date_columns[2].date_input(
+                        "Reorder due date", value=date.today(), disabled=not has_reorder_due
+                    )
+                    notes = st.text_area("Notes")
+                    submitted = st.form_submit_button("Add inventory record", type="primary")
+                if submitted:
+                    try:
+                        item_id = add_item(
+                            {
+                                "item_name": item_name,
+                                "brand": brand,
+                                "category": category,
+                                "test_volume": test_volume,
+                                "description": description,
+                                "batch_no": batch_no,
+                                "storage_location": location,
+                                "unit_price": optional_number(unit_price, "Unit price"),
+                                "total_test_effective": optional_number(
+                                    total_tests, "Total test effective"
+                                ),
+                                "selling_price_per_test": optional_number(
+                                    selling_price, "Selling price per test"
+                                ),
+                                "quantity_in_stock": optional_number(
+                                    quantity, "Quantity in stock"
+                                ),
+                                "reorder_level": optional_number(
+                                    reorder_level, "Reorder level"
+                                ),
+                                "reorder_quantity": optional_number(
+                                    reorder_quantity, "Reorder quantity"
+                                ),
+                                "supplier": supplier,
+                                "reminder_days": optional_number(
+                                    reminder_days, "Reminder days"
+                                ),
+                                "opened_date": opened_date if has_opened else None,
+                                "expiry_date": expiry_date if has_expiry else None,
+                                "reorder_due_date": reorder_due if has_reorder_due else None,
+                                "notes": notes,
+                                "is_active": 1,
+                            }
+                        )
+                        created = get_item(item_id)
+                        st.success(
+                            f"Inventory created — ID {item_id:05d}, code {created['inventory_code']}."
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
 
     with edit_tab:
         if inventory.empty:
@@ -485,20 +688,31 @@ def render_inventory(inventory: pd.DataFrame, warning_days: int) -> None:
         else:
             all_records = fetch_inventory_dataframe(include_archived=True, warning_days=warning_days)
             option_labels = {
-                int(row.id): f"{row.inventory_code} · {row.item_name} · {text_value(row.brand) or 'No brand'}"
+                int(row.id): (
+                    f"ID {int(row.id):05d} · {row.inventory_code} · {row.item_name} · "
+                    f"{text_value(row.brand) or 'No brand'}"
+                )
                 for row in all_records.itertuples()
             }
             selected_id = st.selectbox(
-                "Select record",
-                options=list(option_labels),
+                "Select inventory ID",
+                options=sorted(option_labels),
                 format_func=lambda item_id: option_labels[item_id],
             )
             selected = all_records.loc[all_records["id"].eq(selected_id)].iloc[0]
             suffix = str(selected_id)
+            st.markdown(
+                f'<div class="status-note"><b>Editing inventory ID:</b> {selected_id:05d} &nbsp; '
+                f'<b>Automatic code:</b> {selected["inventory_code"]}</div>',
+                unsafe_allow_html=True,
+            )
             with st.form(f"edit_inventory_{suffix}"):
                 first = st.columns(4)
-                edit_code = first[0].text_input(
-                    "Inventory code", value=str(selected["inventory_code"]), key=f"edit_code_{suffix}"
+                first[0].text_input(
+                    "Inventory code",
+                    value=str(selected["inventory_code"]),
+                    disabled=True,
+                    key=f"edit_code_{suffix}",
                 )
                 edit_name = first[1].text_input(
                     "Item name *", value=str(selected["item_name"]), key=f"edit_name_{suffix}"
@@ -600,7 +814,6 @@ def render_inventory(inventory: pd.DataFrame, warning_days: int) -> None:
                     update_item(
                         selected_id,
                         {
-                            "inventory_code": edit_code,
                             "item_name": edit_name,
                             "brand": edit_brand,
                             "category": edit_category,
@@ -652,7 +865,10 @@ def render_stock_update(inventory: pd.DataFrame, warning_days: int) -> None:
         st.info("Add an active inventory record before recording stock movements.")
         return
     labels = {
-        int(row.id): f"{row.inventory_code} · {row.item_name} · {text_value(row.brand) or 'No brand'}"
+        int(row.id): (
+            f"ID {int(row.id):05d} · {row.inventory_code} · {row.item_name} · "
+            f"{text_value(row.brand) or 'No brand'}"
+        )
         for row in inventory.itertuples()
     }
     item_id = st.selectbox(

@@ -185,7 +185,7 @@ def parse_source_workbook(path: str | Path) -> tuple[list[dict[str, Any]], dict[
 
 
 ALIASES = {
-    "inventory_code": {"inventory code", "inventory id", "code"},
+    "inventory_code": {"inventory code", "code"},
     "item_name": {"item", "item name", "product", "product name"},
     "brand": {"brand", "manufacturer"},
     "category": {"category", "item category"},
