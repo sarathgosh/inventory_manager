@@ -1,0 +1,1322 @@
+from __future__ import annotations
+
+import hashlib
+import re
+from datetime import date
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import streamlit as st
+
+from catalog import (
+    MISSING_OPTION,
+    database_options,
+    filter_by_option,
+    latest_record,
+    numeric_options,
+    option_to_value,
+)
+from database import (
+    add_item,
+    bulk_update_items,
+    create_database_backup,
+    delete_item,
+    fetch_inventory_dataframe,
+    fetch_movements_dataframe,
+    get_item,
+    get_settings,
+    initialize_database,
+    inventory_code_base,
+    insert_items,
+    inventory_count,
+    record_stock_movement,
+    restore_item,
+    save_settings,
+    update_item,
+)
+from importer import parse_source_workbook, parse_tabular_upload, records_preview
+from reports import (
+    build_report_frame,
+    create_excel_report,
+    create_import_template,
+    csv_bytes,
+    display_frame,
+    inventory_summary,
+)
+
+
+APP_DIR = Path(__file__).resolve().parent
+SEED_WORKBOOK = APP_DIR / "data" / "Inventory_list_source.xlsx"
+
+
+st.set_page_config(
+    page_title="Inventory Control Centre",
+    page_icon="📦",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+CUSTOM_CSS = """
+<style>
+    :root {
+        --navy: #12304a;
+        --teal: #00a6a6;
+        --soft: #f4f8fb;
+        --line: #d9e4ec;
+    }
+    .stApp { background: #f7fafc; }
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #102b42 0%, #173f5f 100%);
+    }
+    [data-testid="stSidebar"] * { color: #f7fbff; }
+    [data-testid="stSidebar"] div[role="radiogroup"] label {
+        padding: .55rem .7rem;
+        border-radius: .55rem;
+    }
+    [data-testid="stSidebar"] div[role="radiogroup"] label:hover {
+        background: rgba(255,255,255,.09);
+    }
+    h1, h2, h3 { color: var(--navy); letter-spacing: -0.02em; }
+    .page-kicker {
+        color: var(--teal);
+        font-size: .78rem;
+        font-weight: 800;
+        letter-spacing: .12em;
+        text-transform: uppercase;
+        margin-bottom: .2rem;
+    }
+    .page-subtitle { color: #637381; margin-top: -.55rem; margin-bottom: 1.2rem; }
+    [data-testid="stMetric"] {
+        background: white;
+        border: 1px solid var(--line);
+        border-radius: .8rem;
+        padding: .85rem 1rem;
+        box-shadow: 0 4px 14px rgba(20, 48, 74, .05);
+    }
+    [data-testid="stMetricLabel"] { color: #637381; }
+    [data-testid="stMetricValue"] { color: var(--navy); }
+    .status-note {
+        background: #e8f7f7;
+        border-left: 4px solid var(--teal);
+        color: var(--navy);
+        padding: .75rem 1rem;
+        border-radius: .4rem;
+        margin-bottom: 1rem;
+    }
+    div[data-testid="stDataFrame"] {
+        border: 1px solid var(--line);
+        border-radius: .7rem;
+        overflow: hidden;
+    }
+    .block-container { padding-top: 1.8rem; padding-bottom: 3rem; }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+
+def page_header(title: str, subtitle: str) -> None:
+    st.markdown('<div class="page-kicker">Inventory Management</div>', unsafe_allow_html=True)
+    st.title(title)
+    st.markdown(f'<div class="page-subtitle">{subtitle}</div>', unsafe_allow_html=True)
+
+
+def money(value: Any, symbol: str) -> str:
+    try:
+        if value is None or pd.isna(value):
+            return "—"
+        return f"{symbol}{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def optional_number(text: str, label: str) -> float | None:
+    clean = str(text or "").strip().replace(",", "")
+    if not clean:
+        return None
+    try:
+        value = float(clean)
+    except ValueError as exc:
+        raise ValueError(f"{label} must be a number or left blank.") from exc
+    if value < 0:
+        raise ValueError(f"{label} cannot be negative.")
+    return value
+
+
+def numeric_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+        number = float(value)
+        return f"{number:g}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def text_value(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(value)
+
+
+def date_value(value: Any) -> date:
+    try:
+        if value is not None and not pd.isna(value):
+            return pd.Timestamp(value).date()
+    except (TypeError, ValueError):
+        pass
+    return date.today()
+
+
+def stable_widget_key(prefix: str, *parts: Any) -> str:
+    payload = "|".join(text_value(part) for part in parts)
+    digest = hashlib.sha1(payload.encode("utf-8")).hexdigest()[:10]
+    return f"{prefix}_{digest}"
+
+
+def select_existing_or_new(
+    container: Any,
+    label: str,
+    options: list[str],
+    default: Any,
+    *,
+    key: str,
+    placeholder: str = "Select a database value or enter a new value",
+) -> str | None:
+    clean_options = list(dict.fromkeys(option for option in options if text_value(option)))
+    default_text = text_value(default)
+    if default_text and default_text not in clean_options:
+        clean_options.insert(0, default_text)
+    index = clean_options.index(default_text) if default_text in clean_options else None
+    return container.selectbox(
+        label,
+        options=clean_options,
+        index=index,
+        placeholder=placeholder,
+        accept_new_options=True,
+        key=key,
+    )
+
+
+def apply_inventory_filters(frame: pd.DataFrame, key_prefix: str) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    row1 = st.columns([2.1, 1.2, 1.2, 1.2])
+    search = row1[0].text_input(
+        "Search",
+        placeholder="Item, code, brand, batch or description",
+        key=f"{key_prefix}_search",
+    )
+    brands = sorted(value for value in frame["brand"].dropna().astype(str).unique() if value)
+    selected_brands = row1[1].multiselect("Brand", brands, key=f"{key_prefix}_brand")
+    stock_values = sorted(frame["stock_status"].dropna().astype(str).unique())
+    selected_stock = row1[2].multiselect(
+        "Stock status", stock_values, key=f"{key_prefix}_stock"
+    )
+    expiry_values = sorted(frame["expiry_status"].dropna().astype(str).unique())
+    selected_expiry = row1[3].multiselect(
+        "Expiry status", expiry_values, key=f"{key_prefix}_expiry"
+    )
+    filtered = frame.copy()
+    if search.strip():
+        pattern = re.escape(search.strip())
+        searchable_columns = [
+            column
+            for column in (
+                "inventory_code",
+                "item_name",
+                "brand",
+                "description",
+                "batch_no",
+                "supplier",
+            )
+            if column in filtered.columns
+        ]
+        combined = filtered[searchable_columns].fillna("").astype(str).agg(" ".join, axis=1)
+        filtered = filtered.loc[combined.str.contains(pattern, case=False, regex=True)]
+    if selected_brands:
+        filtered = filtered.loc[filtered["brand"].isin(selected_brands)]
+    if selected_stock:
+        filtered = filtered.loc[filtered["stock_status"].isin(selected_stock)]
+    if selected_expiry:
+        filtered = filtered.loc[filtered["expiry_status"].isin(selected_expiry)]
+    return filtered
+
+
+def initialize_app_data() -> None:
+    initialize_database()
+    if inventory_count() == 0 and SEED_WORKBOOK.exists():
+        records, diagnostics = parse_source_workbook(SEED_WORKBOOK)
+        result = insert_items(records)
+        st.session_state["seed_result"] = {
+            **result,
+            **diagnostics,
+        }
+
+
+def render_dashboard(inventory: pd.DataFrame, currency: str) -> None:
+    page_header(
+        "Dashboard",
+        "Live stock, expiry, reorder and data-quality overview from the SQLite database.",
+    )
+    summary = inventory_summary(inventory)
+    columns = st.columns(6)
+    columns[0].metric("Inventory Records", f"{summary['Total Records']:,}")
+    columns[1].metric("Unique Items", f"{summary['Unique Items']:,}")
+    columns[2].metric("Known Stock Value", money(summary["Known Inventory Value"], currency))
+    columns[3].metric("Reorder Alerts", f"{summary['Reorder Alerts']:,}")
+    columns[4].metric("Expired", f"{summary['Expired Records']:,}")
+    columns[5].metric("Expiring Soon", f"{summary['Expiring Soon']:,}")
+
+    if inventory.empty:
+        st.info("No active inventory records are available yet.")
+        return
+
+    stock_known = int(inventory["quantity_in_stock"].notna().sum())
+    expiry_known = int(inventory["expiry_date"].notna().sum())
+    price_known = int(inventory["unit_price"].notna().sum())
+    reorder_known = int(inventory["reorder_level"].notna().sum())
+    completeness = (stock_known + expiry_known + price_known + reorder_known) / (len(inventory) * 4)
+    st.markdown(
+        f'<div class="status-note"><b>Data readiness:</b> {completeness:.0%} complete across stock, expiry, price and reorder fields. '
+        f'{summary["Stock Quantity Missing"]:,} records still need a stock quantity.</div>',
+        unsafe_allow_html=True,
+    )
+
+    chart_columns = st.columns(3)
+    with chart_columns[0]:
+        st.subheader("Stock status")
+        status_counts = inventory["stock_status"].value_counts().rename("Records")
+        st.bar_chart(status_counts, color="#00A6A6", height=300)
+    with chart_columns[1]:
+        st.subheader("Records by brand")
+        brands = (
+            inventory.assign(brand=inventory["brand"].fillna("Not Set"))
+            .groupby("brand", dropna=False)
+            .size()
+            .sort_values(ascending=False)
+            .head(10)
+            .rename("Records")
+        )
+        st.bar_chart(brands, color="#173F5F", height=300)
+    with chart_columns[2]:
+        st.subheader("Upcoming expiries")
+        expiry = inventory.loc[
+            inventory["expiry_date"].notna() & inventory["days_to_expiry"].between(0, 365)
+        ].copy()
+        if expiry.empty:
+            st.info("No dated expiries in the next 12 months.")
+        else:
+            expiry["Expiry Month"] = expiry["expiry_date"].dt.to_period("M").astype(str)
+            expiry_chart = expiry.groupby("Expiry Month").size().rename("Records")
+            st.bar_chart(expiry_chart, color="#F4B942", height=300)
+
+    st.subheader("Priority attention")
+    priority_order = {
+        "Expired": 0,
+        "Expiring Soon": 1,
+        "Out of Stock": 2,
+        "Low Stock": 3,
+        "Stock Not Set": 4,
+    }
+    priority = inventory.loc[
+        inventory["overall_status"].isin(priority_order)
+    ].copy()
+    priority["_priority"] = priority["overall_status"].map(priority_order)
+    priority = priority.sort_values(
+        ["_priority", "expiry_date", "item_name"], na_position="last"
+    ).head(20)
+    priority_columns = [
+        "id",
+        "inventory_code",
+        "item_name",
+        "brand",
+        "quantity_in_stock",
+        "reorder_level",
+        "expiry_date",
+        "days_to_expiry",
+        "overall_status",
+    ]
+    st.dataframe(
+        display_frame(priority[priority_columns]),
+        use_container_width=True,
+        hide_index=True,
+        height=430,
+    )
+
+
+def render_inventory(inventory: pd.DataFrame, warning_days: int, currency: str) -> None:
+    page_header(
+        "Inventory List",
+        "Search the source records, update key fields in bulk, or maintain one record in detail.",
+    )
+    browse_tab, add_tab, edit_tab, deleted_tab = st.tabs(
+        ["Browse & Quick Update", "Add New Item", "Edit / Delete", "Deleted"]
+    )
+
+    with browse_tab:
+        frame = inventory.copy()
+        filtered = apply_inventory_filters(frame, "inventory")
+        st.caption(f"Showing {len(filtered):,} of {len(frame):,} records")
+        browse_columns = [
+            "id",
+            "inventory_code",
+            "item_name",
+            "brand",
+            "description",
+            "create_date",
+            "unit_price",
+            "total_test_available",
+            "total_test_done",
+            "quantity_in_stock",
+            "reorder_level",
+            "expiry_date",
+            "finish_date",
+            "stock_status",
+            "expiry_status",
+            "inventory_value",
+        ]
+        st.dataframe(
+            display_frame(filtered[browse_columns]),
+            use_container_width=True,
+            hide_index=True,
+            height=470,
+        )
+
+        with st.expander("Quick-update stock, tests, reorder, price and date fields"):
+            if filtered.empty:
+                st.info("No records match the current filters.")
+            else:
+                editable = filtered.head(250).loc[
+                    :,
+                    [
+                        "id",
+                        "inventory_code",
+                        "item_name",
+                        "brand",
+                        "create_date",
+                        "total_test_available",
+                        "total_test_done",
+                        "quantity_in_stock",
+                        "reorder_level",
+                        "reorder_quantity",
+                        "unit_price",
+                        "selling_price_per_test",
+                        "expiry_date",
+                        "finish_date",
+                    ],
+                ].copy()
+                for date_column in ("create_date", "expiry_date", "finish_date"):
+                    editable[date_column] = pd.to_datetime(
+                        editable[date_column], errors="coerce"
+                    ).dt.date
+                if len(filtered) > len(editable):
+                    st.caption("Quick editor is limited to the first 250 filtered records.")
+                edited = st.data_editor(
+                    editable,
+                    hide_index=True,
+                    use_container_width=True,
+                    num_rows="fixed",
+                    disabled=["id", "inventory_code", "item_name", "brand", "create_date"],
+                    column_config={
+                        "id": st.column_config.NumberColumn("ID"),
+                        "inventory_code": st.column_config.TextColumn("Inventory Code"),
+                        "item_name": st.column_config.TextColumn("Item Name"),
+                        "brand": st.column_config.TextColumn("Brand"),
+                        "create_date": st.column_config.DateColumn("Create Date"),
+                        "total_test_available": st.column_config.NumberColumn(
+                            "Total Test Avail", min_value=0.0
+                        ),
+                        "total_test_done": st.column_config.NumberColumn(
+                            "Total Test Done", min_value=0.0
+                        ),
+                        "quantity_in_stock": st.column_config.NumberColumn(
+                            "Quantity In Stock", min_value=0.0
+                        ),
+                        "reorder_level": st.column_config.NumberColumn(
+                            "Reorder Level", min_value=0.0
+                        ),
+                        "reorder_quantity": st.column_config.NumberColumn(
+                            "Reorder Quantity", min_value=0.0
+                        ),
+                        "unit_price": st.column_config.NumberColumn(
+                            "Unit Price", min_value=0.0, format="%.2f"
+                        ),
+                        "selling_price_per_test": st.column_config.NumberColumn(
+                            "Selling Price / Test", min_value=0.0, format="%.2f"
+                        ),
+                        "expiry_date": st.column_config.DateColumn("Expiry Date"),
+                        "finish_date": st.column_config.DateColumn("Finish Date"),
+                    },
+                    key="quick_inventory_editor",
+                )
+                if st.button("Save quick updates", type="primary", key="save_quick"):
+                    try:
+                        rows = edited.to_dict(orient="records")
+                        updated = bulk_update_items(rows)
+                        st.success(f"Saved {updated:,} inventory records.")
+                    except ValueError as exc:
+                        st.error(str(exc))
+
+    with add_tab:
+        st.subheader("Create inventory record")
+        catalogue = fetch_inventory_dataframe(include_deleted=True, warning_days=warning_days)
+        if catalogue.empty:
+            st.info("The database must contain at least one catalogue item before a record can be created.")
+        else:
+            st.caption(
+                "Select an item first. Each following dropdown is limited to values already matched "
+                "to that selection in the database."
+            )
+            item_options = database_options(catalogue, "item_name", include_missing=False)
+            item_name = st.selectbox(
+                "Item name *",
+                options=item_options,
+                index=None,
+                placeholder="Select an inventory item",
+                key="add_catalogue_item",
+            )
+            if item_name is None:
+                st.info("Select an item to load its matching database options.")
+            else:
+                item_rows = filter_by_option(catalogue, "item_name", item_name)
+                selectors = st.columns(4)
+
+                brand_options = database_options(item_rows, "brand")
+                brand_selection = selectors[0].selectbox(
+                    "Brand",
+                    brand_options,
+                    key=stable_widget_key("add_brand", item_name),
+                )
+                brand_rows = filter_by_option(item_rows, "brand", brand_selection)
+
+                category_options = database_options(brand_rows, "category")
+                category_selection = selectors[1].selectbox(
+                    "Category",
+                    category_options,
+                    key=stable_widget_key("add_category", item_name, brand_selection),
+                )
+                category_rows = filter_by_option(brand_rows, "category", category_selection)
+
+                volume_options = database_options(category_rows, "test_volume")
+                volume_selection = selectors[2].selectbox(
+                    "Test volume",
+                    volume_options,
+                    key=stable_widget_key(
+                        "add_volume", item_name, brand_selection, category_selection
+                    ),
+                )
+                volume_rows = filter_by_option(category_rows, "test_volume", volume_selection)
+
+                description_options = database_options(volume_rows, "description")
+                description_selection = selectors[3].selectbox(
+                    "Description / pack size",
+                    description_options,
+                    key=stable_widget_key(
+                        "add_description",
+                        item_name,
+                        brand_selection,
+                        category_selection,
+                        volume_selection,
+                    ),
+                )
+                matching_rows = filter_by_option(
+                    volume_rows, "description", description_selection
+                )
+                matched = latest_record(matching_rows)
+
+                brand = option_to_value(brand_selection)
+                category = option_to_value(category_selection) or "Laboratory Inventory"
+                test_volume = option_to_value(volume_selection)
+                description = option_to_value(description_selection)
+                code_preview = f"{inventory_code_base(item_name, description)}-[ID]"
+                st.markdown(
+                    f'<div class="status-note"><b>Inventory code:</b> {code_preview} &nbsp; '
+                    f'<b>Unique ID:</b> assigned incrementally when saved &nbsp; '
+                    f'<b>Database matches:</b> {len(matching_rows):,}</div>',
+                    unsafe_allow_html=True,
+                )
+
+                def matched_value(field: str) -> Any:
+                    return None if matched is None else matched.get(field)
+
+                form_signature = (
+                    item_name,
+                    brand_selection,
+                    category_selection,
+                    volume_selection,
+                    description_selection,
+                )
+                with st.form(stable_widget_key("add_inventory_form", *form_signature)):
+                    first = st.columns(5)
+                    first[0].text_input(
+                        "Unique inventory ID",
+                        value="Assigned automatically",
+                        disabled=True,
+                    )
+                    first[1].text_input(
+                        "Inventory code",
+                        value=code_preview,
+                        disabled=True,
+                    )
+                    first[2].text_input(
+                        "Create date",
+                        value=date.today().isoformat(),
+                        disabled=True,
+                    )
+                    batch_no = first[3].text_input("Batch / lot no.")
+                    quantity = first[4].text_input(
+                        "Quantity in stock", placeholder="Blank = not set"
+                    )
+
+                    second = st.columns(4)
+                    location = select_existing_or_new(
+                        second[0],
+                        "Storage location",
+                        database_options(item_rows, "storage_location", include_missing=False),
+                        matched_value("storage_location"),
+                        key=stable_widget_key("add_location", *form_signature),
+                    )
+                    supplier = select_existing_or_new(
+                        second[1],
+                        "Supplier",
+                        database_options(item_rows, "supplier", include_missing=False),
+                        matched_value("supplier"),
+                        key=stable_widget_key("add_supplier", *form_signature),
+                    )
+                    unit_price = select_existing_or_new(
+                        second[2],
+                        "Unit price",
+                        numeric_options(matching_rows, "unit_price"),
+                        matched_value("unit_price"),
+                        key=stable_widget_key("add_unit_price", *form_signature),
+                        placeholder="Select an existing price or enter a new one",
+                    )
+                    total_tests = select_existing_or_new(
+                        second[3],
+                        "Total test effective",
+                        numeric_options(matching_rows, "total_test_effective"),
+                        matched_value("total_test_effective"),
+                        key=stable_widget_key("add_total_tests", *form_signature),
+                        placeholder="Select an existing value or enter a new one",
+                    )
+
+                    third = st.columns(4)
+                    selling_price = select_existing_or_new(
+                        third[0],
+                        "Selling price per test",
+                        numeric_options(matching_rows, "selling_price_per_test"),
+                        matched_value("selling_price_per_test"),
+                        key=stable_widget_key("add_selling_price", *form_signature),
+                        placeholder="Select an existing price or enter a new one",
+                    )
+                    reorder_level = select_existing_or_new(
+                        third[1],
+                        "Reorder level",
+                        numeric_options(matching_rows, "reorder_level"),
+                        matched_value("reorder_level"),
+                        key=stable_widget_key("add_reorder_level", *form_signature),
+                        placeholder="Select an existing value or enter a new one",
+                    )
+                    reorder_quantity = select_existing_or_new(
+                        third[2],
+                        "Reorder quantity",
+                        numeric_options(matching_rows, "reorder_quantity"),
+                        matched_value("reorder_quantity"),
+                        key=stable_widget_key("add_reorder_quantity", *form_signature),
+                        placeholder="Select an existing value or enter a new one",
+                    )
+                    reminder_days = select_existing_or_new(
+                        third[3],
+                        "Reminder days",
+                        numeric_options(matching_rows, "reminder_days"),
+                        matched_value("reminder_days"),
+                        key=stable_widget_key("add_reminder_days", *form_signature),
+                        placeholder="Select an existing value or enter a new one",
+                    )
+
+                    test_tracking = st.columns(3)
+                    total_test_available = test_tracking[0].text_input(
+                        "Total test avail", placeholder="Blank = not set"
+                    )
+                    total_test_done = test_tracking[1].text_input(
+                        "Total test done", placeholder="Blank = not set"
+                    )
+                    has_finish = test_tracking[2].checkbox(
+                        "Finish date available", value=False
+                    )
+                    finish_date = test_tracking[2].date_input(
+                        "Finish date", value=date.today(), disabled=not has_finish
+                    )
+
+                    date_columns = st.columns(3)
+                    has_opened = date_columns[0].checkbox("Opened date available", value=False)
+                    opened_date = date_columns[0].date_input(
+                        "Opened date", value=date.today(), disabled=not has_opened
+                    )
+                    has_expiry = date_columns[1].checkbox("Expiry date available", value=True)
+                    expiry_date = date_columns[1].date_input(
+                        "Expiry date", value=date.today(), disabled=not has_expiry
+                    )
+                    has_reorder_due = date_columns[2].checkbox(
+                        "Reorder due date available", value=False
+                    )
+                    reorder_due = date_columns[2].date_input(
+                        "Reorder due date", value=date.today(), disabled=not has_reorder_due
+                    )
+                    notes = st.text_area("Notes")
+                    submitted = st.form_submit_button("Add inventory record", type="primary")
+                if submitted:
+                    try:
+                        item_id = add_item(
+                            {
+                                "item_name": item_name,
+                                "brand": brand,
+                                "category": category,
+                                "test_volume": test_volume,
+                                "description": description,
+                                "batch_no": batch_no,
+                                "storage_location": location,
+                                "unit_price": optional_number(unit_price, "Unit price"),
+                                "total_test_effective": optional_number(
+                                    total_tests, "Total test effective"
+                                ),
+                                "total_test_available": optional_number(
+                                    total_test_available, "Total test avail"
+                                ),
+                                "total_test_done": optional_number(
+                                    total_test_done, "Total test done"
+                                ),
+                                "selling_price_per_test": optional_number(
+                                    selling_price, "Selling price per test"
+                                ),
+                                "quantity_in_stock": optional_number(
+                                    quantity, "Quantity in stock"
+                                ),
+                                "reorder_level": optional_number(
+                                    reorder_level, "Reorder level"
+                                ),
+                                "reorder_quantity": optional_number(
+                                    reorder_quantity, "Reorder quantity"
+                                ),
+                                "supplier": supplier,
+                                "reminder_days": optional_number(
+                                    reminder_days, "Reminder days"
+                                ),
+                                "opened_date": opened_date if has_opened else None,
+                                "expiry_date": expiry_date if has_expiry else None,
+                                "finish_date": finish_date if has_finish else None,
+                                "reorder_due_date": reorder_due if has_reorder_due else None,
+                                "notes": notes,
+                                "is_active": 1,
+                            }
+                        )
+                        created = get_item(item_id)
+                        st.success(
+                            f"Inventory created — ID {item_id:05d}, code {created['inventory_code']}."
+                        )
+                    except ValueError as exc:
+                        st.error(str(exc))
+
+    with edit_tab:
+        if inventory.empty:
+            st.info("No records are available to edit.")
+        else:
+            active_records = inventory.copy()
+            option_labels = {
+                int(row.id): (
+                    f"ID {int(row.id):05d} · {row.inventory_code} · {row.item_name} · "
+                    f"{text_value(row.brand) or 'No brand'}"
+                )
+                for row in active_records.itertuples()
+            }
+            selected_id = st.selectbox(
+                "Select inventory ID",
+                options=sorted(option_labels),
+                format_func=lambda item_id: option_labels[item_id],
+            )
+            selected = active_records.loc[active_records["id"].eq(selected_id)].iloc[0]
+            suffix = str(selected_id)
+            create_date_label = (
+                date_value(selected["create_date"]).isoformat()
+                if not pd.isna(selected["create_date"])
+                else "Not available"
+            )
+            st.markdown(
+                f'<div class="status-note"><b>Editing inventory ID:</b> {selected_id:05d} &nbsp; '
+                f'<b>Automatic code:</b> {selected["inventory_code"]} &nbsp; '
+                f'<b>Create date:</b> {create_date_label}</div>',
+                unsafe_allow_html=True,
+            )
+            with st.form(f"edit_inventory_{suffix}"):
+                first = st.columns(5)
+                first[0].text_input(
+                    "Inventory code",
+                    value=str(selected["inventory_code"]),
+                    disabled=True,
+                    key=f"edit_code_{suffix}",
+                )
+                first[1].text_input(
+                    "Create date",
+                    value="" if create_date_label == "Not available" else create_date_label,
+                    disabled=True,
+                    key=f"edit_create_date_{suffix}",
+                )
+                edit_name = first[2].text_input(
+                    "Item name *", value=str(selected["item_name"]), key=f"edit_name_{suffix}"
+                )
+                edit_brand = first[3].text_input(
+                    "Brand", value=text_value(selected["brand"]), key=f"edit_brand_{suffix}"
+                )
+                edit_category = first[4].text_input(
+                    "Category", value=text_value(selected["category"]), key=f"edit_category_{suffix}"
+                )
+                second = st.columns(4)
+                edit_test_volume = second[0].text_input(
+                    "Test volume", value=text_value(selected["test_volume"]), key=f"edit_volume_{suffix}"
+                )
+                edit_description = second[1].text_input(
+                    "Description", value=text_value(selected["description"]), key=f"edit_desc_{suffix}"
+                )
+                edit_batch = second[2].text_input(
+                    "Batch / lot no.", value=text_value(selected["batch_no"]), key=f"edit_batch_{suffix}"
+                )
+                edit_location = second[3].text_input(
+                    "Storage location", value=text_value(selected["storage_location"]), key=f"edit_loc_{suffix}"
+                )
+                third = st.columns(4)
+                edit_unit_price = third[0].text_input(
+                    "Unit price", value=numeric_text(selected["unit_price"]), key=f"edit_price_{suffix}"
+                )
+                edit_total_tests = third[1].text_input(
+                    "Total test effective",
+                    value=numeric_text(selected["total_test_effective"]),
+                    key=f"edit_tests_{suffix}",
+                )
+                edit_selling = third[2].text_input(
+                    "Selling price per test",
+                    value=numeric_text(selected["selling_price_per_test"]),
+                    key=f"edit_sell_{suffix}",
+                )
+                edit_quantity = third[3].text_input(
+                    "Quantity in stock",
+                    value=numeric_text(selected["quantity_in_stock"]),
+                    key=f"edit_qty_{suffix}",
+                )
+                fourth = st.columns(4)
+                edit_reorder_level = fourth[0].text_input(
+                    "Reorder level",
+                    value=numeric_text(selected["reorder_level"]),
+                    key=f"edit_reorder_{suffix}",
+                )
+                edit_reorder_qty = fourth[1].text_input(
+                    "Reorder quantity",
+                    value=numeric_text(selected["reorder_quantity"]),
+                    key=f"edit_reorder_qty_{suffix}",
+                )
+                edit_supplier = fourth[2].text_input(
+                    "Supplier", value=text_value(selected["supplier"]), key=f"edit_supplier_{suffix}"
+                )
+                edit_reminder = fourth[3].text_input(
+                    "Reminder days",
+                    value=numeric_text(selected["reminder_days"]),
+                    key=f"edit_reminder_{suffix}",
+                )
+                test_tracking = st.columns(3)
+                edit_total_available = test_tracking[0].text_input(
+                    "Total test avail",
+                    value=numeric_text(selected["total_test_available"]),
+                    key=f"edit_test_available_{suffix}",
+                )
+                edit_total_done = test_tracking[1].text_input(
+                    "Total test done",
+                    value=numeric_text(selected["total_test_done"]),
+                    key=f"edit_test_done_{suffix}",
+                )
+                finish_known = not pd.isna(selected["finish_date"])
+                edit_has_finish = test_tracking[2].checkbox(
+                    "Finish date available",
+                    value=finish_known,
+                    key=f"edit_has_finish_{suffix}",
+                )
+                edit_finish = test_tracking[2].date_input(
+                    "Finish date",
+                    value=date_value(selected["finish_date"]),
+                    disabled=not edit_has_finish,
+                    key=f"edit_finish_{suffix}",
+                )
+                dates = st.columns(3)
+                opened_known = not pd.isna(selected["opened_date"])
+                edit_has_opened = dates[0].checkbox(
+                    "Opened date available", value=opened_known, key=f"edit_has_opened_{suffix}"
+                )
+                edit_opened = dates[0].date_input(
+                    "Opened date",
+                    value=date_value(selected["opened_date"]),
+                    disabled=not edit_has_opened,
+                    key=f"edit_opened_{suffix}",
+                )
+                expiry_known = not pd.isna(selected["expiry_date"])
+                edit_has_expiry = dates[1].checkbox(
+                    "Expiry date available", value=expiry_known, key=f"edit_has_expiry_{suffix}"
+                )
+                edit_expiry = dates[1].date_input(
+                    "Expiry date",
+                    value=date_value(selected["expiry_date"]),
+                    disabled=not edit_has_expiry,
+                    key=f"edit_expiry_{suffix}",
+                )
+                due_known = not pd.isna(selected["reorder_due_date"])
+                edit_has_due = dates[2].checkbox(
+                    "Reorder due date available", value=due_known, key=f"edit_has_due_{suffix}"
+                )
+                edit_due = dates[2].date_input(
+                    "Reorder due date",
+                    value=date_value(selected["reorder_due_date"]),
+                    disabled=not edit_has_due,
+                    key=f"edit_due_{suffix}",
+                )
+                edit_notes = st.text_area(
+                    "Notes", value=text_value(selected["notes"]), key=f"edit_notes_{suffix}"
+                )
+                edit_submitted = st.form_submit_button("Save record", type="primary")
+            if edit_submitted:
+                try:
+                    update_item(
+                        selected_id,
+                        {
+                            "item_name": edit_name,
+                            "brand": edit_brand,
+                            "category": edit_category,
+                            "test_volume": edit_test_volume,
+                            "description": edit_description,
+                            "batch_no": edit_batch,
+                            "storage_location": edit_location,
+                            "unit_price": optional_number(edit_unit_price, "Unit price"),
+                            "total_test_effective": optional_number(edit_total_tests, "Total test effective"),
+                            "total_test_available": optional_number(
+                                edit_total_available, "Total test avail"
+                            ),
+                            "total_test_done": optional_number(
+                                edit_total_done, "Total test done"
+                            ),
+                            "selling_price_per_test": optional_number(edit_selling, "Selling price per test"),
+                            "quantity_in_stock": optional_number(edit_quantity, "Quantity in stock"),
+                            "reorder_level": optional_number(edit_reorder_level, "Reorder level"),
+                            "reorder_quantity": optional_number(edit_reorder_qty, "Reorder quantity"),
+                            "supplier": edit_supplier,
+                            "reminder_days": optional_number(edit_reminder, "Reminder days"),
+                            "opened_date": edit_opened if edit_has_opened else None,
+                            "expiry_date": edit_expiry if edit_has_expiry else None,
+                            "finish_date": edit_finish if edit_has_finish else None,
+                            "reorder_due_date": edit_due if edit_has_due else None,
+                            "notes": edit_notes,
+                        },
+                    )
+                    st.success("Inventory record updated.")
+                except ValueError as exc:
+                    st.error(str(exc))
+
+            st.divider()
+            confirmed = st.checkbox(
+                "I confirm that I want to delete this record",
+                key=f"delete_confirm_{suffix}",
+            )
+            if st.button(
+                "Delete record",
+                disabled=not confirmed,
+                type="secondary",
+                key=f"delete_button_{suffix}",
+            ):
+                delete_item(selected_id)
+                st.success("Record deleted. It remains available in the Deleted tab and reports.")
+
+    with deleted_tab:
+        st.subheader("Deleted inventory records")
+        deleted = fetch_inventory_dataframe(deleted_only=True, warning_days=warning_days)
+        if deleted.empty:
+            st.info("No inventory records have been deleted.")
+        else:
+            filtered_deleted = apply_inventory_filters(deleted, "deleted_inventory")
+            deleted_report = build_report_frame("Deleted Inventory Report", filtered_deleted)
+            st.caption(
+                f"Showing {len(filtered_deleted):,} of {len(deleted):,} deleted records. "
+                "Deleted records are retained for reporting and can be restored."
+            )
+            st.dataframe(
+                display_frame(deleted_report),
+                use_container_width=True,
+                hide_index=True,
+                height=470,
+            )
+            deleted_summary = inventory_summary(filtered_deleted)
+            deleted_excel = create_excel_report(
+                "Deleted Inventory Report", deleted_report, deleted_summary, currency
+            )
+            deleted_downloads = st.columns(2)
+            deleted_downloads[0].download_button(
+                "Download deleted records (Excel)",
+                data=deleted_excel,
+                file_name=f"deleted_inventory_{date.today().isoformat()}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+            deleted_downloads[1].download_button(
+                "Download deleted records (CSV)",
+                data=csv_bytes(deleted_report),
+                file_name=f"deleted_inventory_{date.today().isoformat()}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+            st.divider()
+            deleted_labels = {
+                int(row.id): (
+                    f"ID {int(row.id):05d} · {row.inventory_code} · {row.item_name} · "
+                    f"{text_value(row.brand) or 'No brand'}"
+                )
+                for row in deleted.itertuples()
+            }
+            restore_id = st.selectbox(
+                "Select deleted inventory ID",
+                options=sorted(deleted_labels),
+                format_func=lambda item_id: deleted_labels[item_id],
+                key="restore_inventory_id",
+            )
+            restore_confirmed = st.checkbox(
+                "I confirm that I want to restore this record",
+                key=f"restore_confirm_{restore_id}",
+            )
+            if st.button(
+                "Restore record",
+                disabled=not restore_confirmed,
+                key=f"restore_button_{restore_id}",
+            ):
+                restore_item(restore_id)
+                st.success("Inventory record restored to the active list.")
+
+
+def render_stock_update(inventory: pd.DataFrame, warning_days: int) -> None:
+    page_header(
+        "Stock Update",
+        "Receive, issue or adjust stock with a permanent movement history.",
+    )
+    if inventory.empty:
+        st.info("Add an active inventory record before recording stock movements.")
+        return
+    labels = {
+        int(row.id): (
+            f"ID {int(row.id):05d} · {row.inventory_code} · {row.item_name} · "
+            f"{text_value(row.brand) or 'No brand'}"
+        )
+        for row in inventory.itertuples()
+    }
+    item_id = st.selectbox(
+        "Inventory record",
+        options=list(labels),
+        format_func=lambda selected_id: labels[selected_id],
+    )
+    selected = inventory.loc[inventory["id"].eq(item_id)].iloc[0]
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Current Quantity", numeric_text(selected["quantity_in_stock"]) or "Not set")
+    metric_columns[1].metric("Reorder Level", numeric_text(selected["reorder_level"]) or "Not set")
+    metric_columns[2].metric("Stock Status", selected["stock_status"])
+    metric_columns[3].metric("Expiry Status", selected["expiry_status"])
+
+    with st.form("stock_movement_form", clear_on_submit=True):
+        columns = st.columns(3)
+        movement_type = columns[0].selectbox("Movement type", ["Receive", "Issue", "Adjustment"])
+        quantity_label = "New stock balance" if movement_type == "Adjustment" else "Quantity"
+        quantity = columns[1].number_input(quantity_label, min_value=0.0, value=0.0, step=1.0)
+        movement_date = columns[2].date_input("Movement date", value=date.today())
+        details = st.columns(2)
+        reference = details[0].text_input("Reference", placeholder="PO, invoice, request or adjustment reference")
+        notes = details[1].text_input("Notes")
+        movement_submit = st.form_submit_button("Save stock movement", type="primary")
+    if movement_submit:
+        try:
+            new_balance = record_stock_movement(
+                item_id,
+                movement_type,
+                quantity,
+                reference=reference,
+                notes=notes,
+                moved_at=movement_date,
+            )
+            st.success(f"Stock movement saved. New balance: {new_balance:g}.")
+        except ValueError as exc:
+            st.error(str(exc))
+
+    st.subheader("Recent movement history")
+    movements = fetch_movements_dataframe()
+    movements = movements.loc[movements["inventory_code"].eq(selected["inventory_code"])].head(100)
+    if movements.empty:
+        st.info("No stock movements have been recorded for this item.")
+    else:
+        st.dataframe(
+            display_frame(
+                movements[
+                    [
+                        "moved_at",
+                        "movement_type",
+                        "quantity_change",
+                        "quantity_before",
+                        "quantity_after",
+                        "reference",
+                        "notes",
+                    ]
+                ]
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+def render_reports(inventory: pd.DataFrame, currency: str, warning_days: int) -> None:
+    page_header(
+        "Reports",
+        "View filtered reports and download formatted Excel or CSV files.",
+    )
+    report_name = st.selectbox(
+        "Report type",
+        [
+            "Full Inventory Report",
+            "Reorder Report",
+            "Expiry Report",
+            "Inventory Valuation Report",
+            "Data Quality Report",
+            "Deleted Inventory Report",
+            "Stock Movement Report",
+        ],
+    )
+    movements = fetch_movements_dataframe()
+    filtered_inventory = (
+        fetch_inventory_dataframe(deleted_only=True, warning_days=warning_days)
+        if report_name == "Deleted Inventory Report"
+        else inventory.copy()
+    )
+    filter_columns = st.columns([2, 1.2, 1.2])
+    search = filter_columns[0].text_input("Search report", placeholder="Item, code or brand")
+    brands = sorted(filtered_inventory["brand"].dropna().astype(str).unique())
+    report_brands = filter_columns[1].multiselect("Brand", brands)
+    categories = sorted(filtered_inventory["category"].dropna().astype(str).unique())
+    report_categories = filter_columns[2].multiselect("Category", categories)
+    if search.strip() and not filtered_inventory.empty:
+        pattern = re.escape(search.strip())
+        combined = filtered_inventory[["inventory_code", "item_name", "brand"]].fillna("").astype(str).agg(" ".join, axis=1)
+        filtered_inventory = filtered_inventory.loc[combined.str.contains(pattern, case=False, regex=True)]
+        if not movements.empty:
+            movement_search = movements[["inventory_code", "item_name", "brand"]].fillna("").astype(str).agg(" ".join, axis=1)
+            movements = movements.loc[movement_search.str.contains(pattern, case=False, regex=True)]
+    if report_brands:
+        filtered_inventory = filtered_inventory.loc[filtered_inventory["brand"].isin(report_brands)]
+        if not movements.empty:
+            movements = movements.loc[movements["brand"].isin(report_brands)]
+    if report_categories:
+        filtered_inventory = filtered_inventory.loc[filtered_inventory["category"].isin(report_categories)]
+
+    report_frame = build_report_frame(report_name, filtered_inventory, movements)
+    summary = inventory_summary(filtered_inventory)
+    st.caption(f"{len(report_frame):,} report rows")
+    st.dataframe(
+        display_frame(report_frame),
+        use_container_width=True,
+        hide_index=True,
+        height=510,
+    )
+    excel = create_excel_report(report_name, report_frame, summary, currency)
+    slug = re.sub(r"[^a-z0-9]+", "_", report_name.lower()).strip("_")
+    download_columns = st.columns(2)
+    download_columns[0].download_button(
+        "Download Excel report",
+        data=excel,
+        file_name=f"{slug}_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
+        use_container_width=True,
+    )
+    download_columns[1].download_button(
+        "Download CSV report",
+        data=csv_bytes(report_frame),
+        file_name=f"{slug}_{date.today().isoformat()}.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+def render_import_backup(inventory: pd.DataFrame, currency: str) -> None:
+    page_header(
+        "Import & Backup",
+        "Import updated lists, download a clean template, and keep recoverable backups.",
+    )
+    st.subheader("Import inventory")
+    uploaded = st.file_uploader("Upload Excel or CSV", type=["xlsx", "xlsm", "csv"])
+    if uploaded is not None:
+        try:
+            records, diagnostics = parse_tabular_upload(uploaded.name, uploaded.getvalue())
+            metric_columns = st.columns(3)
+            metric_columns[0].metric("Rows Ready", f"{diagnostics['records']:,}")
+            metric_columns[1].metric("Missing Stock", f"{diagnostics['records_missing_stock']:,}")
+            metric_columns[2].metric("Missing Expiry", f"{diagnostics['records_missing_expiry']:,}")
+            st.caption("Mapped fields: " + ", ".join(diagnostics["mapped_fields"]))
+            st.dataframe(records_preview(records), use_container_width=True, hide_index=True)
+            mode = st.radio("Import mode", ["Append to current inventory", "Replace current inventory"])
+            confirm_replace = True
+            if mode == "Replace current inventory":
+                st.warning("Replace mode removes the current inventory and its stock-movement history.")
+                confirm_replace = st.checkbox("I have downloaded a backup and confirm replacement")
+            if st.button(
+                "Import records",
+                type="primary",
+                disabled=not records or not confirm_replace,
+            ):
+                result = insert_items(records, replace=mode == "Replace current inventory")
+                st.success(
+                    f"Import complete: {result['inserted']:,} inserted, {result['skipped']:,} skipped."
+                )
+        except (ValueError, OSError) as exc:
+            st.error(str(exc))
+
+    st.divider()
+    st.subheader("Downloads and backup")
+    st.caption("Use the template for future imports. Keep database backups before bulk replacements.")
+    full_report = build_report_frame("Full Inventory Report", inventory)
+    summary = inventory_summary(inventory)
+    full_excel = create_excel_report("Full Inventory Report", full_report, summary, currency)
+    backup_columns = st.columns(3)
+    backup_columns[0].download_button(
+        "Download import template",
+        data=create_import_template(),
+        file_name="inventory_import_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    backup_columns[1].download_button(
+        "Download all inventory",
+        data=full_excel,
+        file_name=f"inventory_export_{date.today().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+    backup_columns[2].download_button(
+        "Download database backup",
+        data=create_database_backup(),
+        file_name=f"inventory_backup_{date.today().isoformat()}.db",
+        mime="application/octet-stream",
+        use_container_width=True,
+    )
+
+
+def render_settings(inventory: pd.DataFrame, settings: dict[str, str]) -> None:
+    page_header(
+        "Settings",
+        "Configure report identity, currency display and expiry alert timing.",
+    )
+    with st.form("settings_form"):
+        columns = st.columns(3)
+        business_name = columns[0].text_input(
+            "Business / facility name", value=settings.get("business_name", "Inventory Control Centre")
+        )
+        currency_symbol = columns[1].text_input(
+            "Currency symbol", value=settings.get("currency_symbol", "₹"), max_chars=5
+        )
+        expiry_days = columns[2].number_input(
+            "Expiring-soon warning (days)",
+            min_value=1,
+            max_value=365,
+            value=int(settings.get("expiry_warning_days", "30")),
+        )
+        save = st.form_submit_button("Save settings", type="primary")
+    if save:
+        save_settings(
+            {
+                "business_name": business_name.strip() or "Inventory Control Centre",
+                "currency_symbol": currency_symbol.strip() or "₹",
+                "expiry_warning_days": int(expiry_days),
+            }
+        )
+        st.success("Settings saved. Refresh the page to apply the new heading and alert window.")
+
+    st.subheader("Database health")
+    summary = inventory_summary(inventory)
+    health = pd.DataFrame(
+        {
+            "Check": [
+                "Active inventory records",
+                "Records with stock quantity",
+                "Records with expiry date",
+                "Records with unit price",
+                "Records needing source-value review",
+            ],
+            "Count": [
+                len(inventory),
+                int(inventory["quantity_in_stock"].notna().sum()) if not inventory.empty else 0,
+                int(inventory["expiry_date"].notna().sum()) if not inventory.empty else 0,
+                int(inventory["unit_price"].notna().sum()) if not inventory.empty else 0,
+                int(inventory["source_notes"].fillna("").astype(str).str.len().gt(0).sum())
+                if not inventory.empty
+                else 0,
+            ],
+        }
+    )
+    st.dataframe(health, use_container_width=True, hide_index=True)
+    st.caption(
+        f"Current known inventory value: {money(summary['Known Inventory Value'], settings.get('currency_symbol', '₹'))}."
+    )
+
+
+def main() -> None:
+    initialize_app_data()
+    settings = get_settings()
+    warning_days = int(settings.get("expiry_warning_days", "30"))
+    currency = settings.get("currency_symbol", "₹")
+    inventory = fetch_inventory_dataframe(warning_days=warning_days)
+
+    st.sidebar.markdown("## 📦 Inventory")
+    st.sidebar.caption(settings.get("business_name", "Inventory Control Centre"))
+    page = st.sidebar.radio(
+        "Navigation",
+        [
+            "Dashboard",
+            "Inventory List",
+            "Stock Update",
+            "Reports",
+            "Import & Backup",
+            "Settings",
+        ],
+        label_visibility="collapsed",
+    )
+    st.sidebar.divider()
+    st.sidebar.caption(f"{len(inventory):,} active records · SQLite database")
+
+    seed_result = st.session_state.pop("seed_result", None)
+    if seed_result:
+        st.success(
+            f"Initial workbook imported: {seed_result['inserted']:,} records. "
+            f"{seed_result['records_missing_stock']:,} records are flagged for stock entry."
+        )
+
+    if page == "Dashboard":
+        render_dashboard(inventory, currency)
+    elif page == "Inventory List":
+        render_inventory(inventory, warning_days, currency)
+    elif page == "Stock Update":
+        render_stock_update(inventory, warning_days)
+    elif page == "Reports":
+        render_reports(inventory, currency, warning_days)
+    elif page == "Import & Backup":
+        render_import_backup(inventory, currency)
+    else:
+        render_settings(inventory, settings)
+
+
+if __name__ == "__main__":
+    main()

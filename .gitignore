@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+data/inventory.db
+data/inventory.db-shm
+data/inventory.db-wal
+*.log
+
